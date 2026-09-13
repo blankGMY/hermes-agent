@@ -135,6 +135,7 @@ def _display_session_cwd(session: dict | None) -> str:
     healed = _heal_dead_cwd(cwd)
     if healed and healed != cwd and session is not None:
         session["cwd"] = healed
+        session["_core_trusted_context"] = None
         _persist_session_cwd_and_schedule_git_meta(session, healed)
     return healed
 
@@ -515,12 +516,30 @@ def _persist_session_cwd_and_schedule_git_meta(session: dict, cwd: str, *, db=No
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
     from hermes_constants import translate_cwd_for_wsl_backend
+    from hermes_cli.pre_user_message import snapshot_core_workspace
     cwd = translate_cwd_for_wsl_backend(str(cwd))
     resolved = os.path.abspath(os.path.expanduser(cwd))
     if not os.path.isdir(resolved):
         raise ValueError(f"working directory does not exist: {cwd}")
+    safe_workspace = snapshot_core_workspace(resolved)
+    if safe_workspace is None:
+        raise ValueError("working directory is not a safe workspace")
+    resolved = safe_workspace
     # An explicit user choice: persisted as the workspace (not the launch-dir fallback), superseding a settle-adopted cwd.
     session.update(cwd=resolved, explicit_cwd=True, cwd_from_settle=False)
+    try:
+        from hermes_cli.pre_user_message import (
+            _CORE_ISSUER,
+            _replace_core_trusted_context,
+            is_core_stamped_context,
+        )
+        core_context = session.get("_core_trusted_context")
+        if is_core_stamped_context(core_context):
+            session["_core_trusted_context"] = _replace_core_trusted_context(
+                core_context, issuer=_CORE_ISSUER, workspace_root=resolved
+            )
+    except Exception:
+        session["_core_trusted_context"] = None
     _register_session_cwd(session)
     # The synchronous DB write claims ordering authority; git probes may publish only for that exact generation.
     _persist_session_cwd_and_schedule_git_meta(session, resolved)

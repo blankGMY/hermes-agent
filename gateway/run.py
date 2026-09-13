@@ -3426,6 +3426,17 @@ class GatewayRunner(
         # .env resolve as secondary profiles' do; explicit config= injection (tests) is left untouched.
         # See #64674.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # Core captures an explicit host workspace once at runner construction. Never derive this from
+        # a mutable inbound source, TERMINAL_CWD, or the process CWD; a missing snapshot disables only
+        # the governed Project MAIN control.
+        try:
+            from hermes_cli.pre_user_message import _CORE_ISSUER, _stamp_core_workspace
+            self._core_gateway_workspace_root = _stamp_core_workspace(
+                getattr(self.config, "current_chat_main_workspace_root", None),
+                issuer=_CORE_ISSUER,
+            )
+        except Exception:
+            self._core_gateway_workspace_root = None
         # Multiplexer flag flips agent.secret_scope.get_secret() to fail-closed on unscoped credential
         # reads, so a missed migration crashes loudly instead of leaking a cross-profile value.
         try:

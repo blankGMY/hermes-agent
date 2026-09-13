@@ -23,10 +23,35 @@ def _plugin_hooks(hook_name: str, **kwargs: Any) -> List[Any]:
     return plugins.invoke_hook(hook_name, **kwargs)
 
 
+# Core identity token held by the trusted Hermes extension boundary for the one
+# governed, behavior-changing hook. A plugin-id string supplied through kwargs
+# is never authority. Python plugins execute in-process and are not a sandbox;
+# hostile extension code is outside this interpreter-level trust boundary.
+_CORE_PLUGIN_OWNER_PROJECT_MAIN = object()
+
+
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Notify first-party observers, then invoke compatibility plugin hooks."""
+    """Notify observers, then invoke compatibility plugin hooks.
+
+    ``_core_plugin_owner`` is an internal capability, not a plugin-id input.
+    Invalid owner values fail closed instead of allowing arbitrary callers to
+    select a behavior-changing plugin callback.
+    """
+    owner = kwargs.pop("_core_plugin_owner", None)
     _observe(hook_name, **kwargs)
+    if owner is not None:
+        if owner is not _CORE_PLUGIN_OWNER_PROJECT_MAIN:
+            return []
+        return _plugin_hooks_for_owner(owner, hook_name, **kwargs)
     return _plugin_hooks(hook_name, **kwargs)
+
+
+def _plugin_hooks_for_owner(owner: object, hook_name: str, **kwargs: Any) -> List[Any]:
+    from hermes_cli import plugins
+
+    if owner is not _CORE_PLUGIN_OWNER_PROJECT_MAIN:
+        return []
+    return plugins.invoke_hook_for_capability(owner, hook_name, **kwargs)
 
 
 def has_hook(hook_name: str) -> bool:

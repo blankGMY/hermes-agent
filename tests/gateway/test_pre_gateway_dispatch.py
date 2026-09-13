@@ -1,8 +1,9 @@
 """Tests for the pre_gateway_dispatch plugin hook.
 
-The hook allows plugins to intercept incoming messages before auth and
-agent dispatch. It runs in _handle_message and acts on returned action
-dicts: {"action": "skip"|"rewrite"|"allow"}.
+The hook allows plugins to intercept authorized incoming messages before agent
+dispatch. It runs in _handle_message and acts on returned action dicts:
+{"action": "skip"|"rewrite"|"allow"}. Governed control messages are
+classified before behavior-changing plugin hooks.
 """
 
 from types import SimpleNamespace
@@ -89,16 +90,9 @@ async def test_internal_events_bypass_hook(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_hook_fires_without_session_store_attribute(monkeypatch):
-    """A runner missing session_store still delivers the event to plugins.
-
-    Regression: the hook kwargs read ``self.session_store`` directly, so a
-    partially-initialized runner raised AttributeError inside the dispatch
-    try-block — the hook never fired, and every message logged
-    "pre_gateway_dispatch invocation failed: 'GatewayRunner' object has no
-    attribute 'session_store'". Plugins must receive the event (with
-    session_store=None) instead.
-    """
+    """An authorized message still reaches hooks on a partial runner."""
     _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
 
     seen = {}
 
@@ -115,6 +109,5 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
 
     result = await runner._handle_message(_make_event("hi"))
     assert result is None
-    # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()

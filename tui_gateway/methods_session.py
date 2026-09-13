@@ -13,6 +13,35 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _core_tui_context(session_key: str, session: dict, *, surface: str = "tui"):
+    """Create the immutable context owned by a live TUI session record."""
+    from hermes_cli.pre_user_message import _CORE_ISSUER, _stamp_core_trusted_context
+    profile_home = session.get("profile_home")
+    try:
+        from hermes_constants import profile_name_for_home
+        profile_id = profile_name_for_home(profile_home) if profile_home else None
+    except Exception:
+        profile_id = None
+    if not profile_id:
+        try:
+            profile_id = _current_profile_name()
+        except Exception:
+            profile_id = "default"
+    return _stamp_core_trusted_context({
+        "session_id": str(session_key or ""),
+        "profile_id": str(profile_id or ""),
+        "connection_id": "tui-gateway",
+        "workspace_root": (
+            str(session.get("cwd")) if session.get("explicit_cwd") else None
+        ),
+        "session_title": session.get("title") or session.get("pending_title") or "",
+        "conversation_kind": session.get("conversation_kind") or "tui_chat",
+        "surface": surface,
+        "profile_home": profile_home,
+        "bound_project_id": None,
+    }, issuer=_CORE_ISSUER)
+
+
 # ── shared handler plumbing ──────────────────────────────────────────
 def _session_arg(resolve):
     """Resolve ``params.session_id`` via ``resolve`` (a lambda — decoration precedes bind_module) → 3rd arg."""
@@ -358,6 +387,7 @@ def _(rid, params: dict) -> dict:
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport}
+        _sessions[sid]["_core_trusted_context"] = _core_tui_context(key, _sessions[sid])
         _register_session_cwd(_sessions[sid])
     # No DB row here (drafts left "Untitled" litter): created on the first prompt — except seeded sessions.
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop launch (and every "New agent" /
@@ -484,6 +514,7 @@ class _Resume:
     def __init__(self, rid, params: dict, target: str) -> None:
         self.rid, self.params, self.target = rid, params, target
         self.db, self.owns_db, self.found, self.profile_resume_cwd = None, False, None, ""
+        self.persisted_cwd = ""
         self.cols = _int_param(params, "cols", 80)
         # ``profile`` (app-global remote mode): resume from another local profile's state.db.
         self.profile = (params.get("profile") or "").strip() or None
@@ -507,7 +538,7 @@ class _Resume:
         return _deferred_session_record(
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
             close_on_disconnect=_flag(self.params, "close_on_disconnect"),
-            profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd), **extra)
+            profile_home=self.profile_home, explicit_cwd=bool(self.persisted_cwd), **extra)
 
     def claim(self, sid: str, record: dict) -> dict | None:
         """Register ``record`` live under the resume lock, or reuse a concurrent winner's session."""
@@ -793,7 +824,7 @@ def _resume_eager(ctx: _Resume) -> dict:
         try:
             with _profile_build_scope(ctx.profile_home):
                 _init_session(sid, ctx.target, agent, history, cols=ctx.cols, cwd=ctx.profile_resume_cwd,
-                              session_db=ctx.db, source=source, explicit_cwd=bool(ctx.profile_resume_cwd))
+                              session_db=ctx.db, source=source, explicit_cwd=bool(ctx.persisted_cwd))
                 # Ownership TRANSFER: the agent holds the handle for life (AIAgent.close() releases it). The
                 # owns_db drop is UNCONDITIONAL — the session is registered against the handle, so the finally
                 # must not close it even if the transfer was refused (a leak beats "closed database" every
@@ -837,7 +868,8 @@ def _(rid, params: dict) -> dict:
         _resume_follow_tip(ctx)
         if (resp := _resume_guard(ctx)) is not None:
             return resp
-        ctx.profile_resume_cwd = _str_param(ctx.found, "cwd") or _profile_configured_cwd(ctx.profile_home)
+        ctx.persisted_cwd = _str_param(ctx.found, "cwd")
+        ctx.profile_resume_cwd = ctx.persisted_cwd or _profile_configured_cwd(ctx.profile_home)
         # Fast path: reuse a session live IN THIS PROFILE (never another profile's runtime).
         with _session_resume_lock:
             live = _find_live_session_by_key(ctx.target, ctx.profile_home)

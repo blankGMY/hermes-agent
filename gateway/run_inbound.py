@@ -15,8 +15,10 @@ import dataclasses
 import json
 import os
 import re
+import threading
 import time
 from contextlib import suppress
+from pathlib import Path
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
@@ -24,7 +26,7 @@ from gateway.run_common import _UNSET
 from gateway.session import (
     SessionSource, is_shared_multi_user_session, neutralize_untrusted_inline_text
 )
-from gateway.turn_lease import TurnLeaseTimeoutError
+from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -43,7 +45,7 @@ class GatewayInboundMixin:
     ) -> Optional["MessageEvent"]:
         """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
         Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
-        ``allow``/None → normal dispatch. Runs BEFORE auth so plugins can handle unauthorized senders."""
+        ``allow``/None → normal dispatch. The caller runs it only after route/auth checks."""
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _hook_results = _invoke_hook(
@@ -183,10 +185,28 @@ class GatewayInboundMixin:
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
-        event = self._hm_pre_gateway_dispatch_hook(event, source)
-        if event is None:
-            return None
-        source = event.source
+        original_control_text = getattr(event, "text", None)
+        _recognized_control = False
+        if isinstance(original_control_text, str):
+            try:
+                from hermes_cli.pre_user_message import is_project_main_control_message
+                _recognized_control = is_project_main_control_message(original_control_text)
+            except Exception:
+                logger.debug("pre_user_message classifier unavailable at gateway ingress")
+                try:
+                    from hermes_cli.project_main_control_fallback import (
+                        is_project_main_control_message_fallback,
+                    )
+                    _recognized_control = is_project_main_control_message_fallback(
+                        original_control_text
+                    )
+                except Exception:
+                    _recognized_control = False
+        # A governed control is classified from the literal inbound message
+        # before any behavior-changing plugin hook. The control is still
+        # authorized below and is never derived from a plugin rewrite.
+        if _recognized_control:
+            event._hm_pre_user_message_text = original_control_text
 
         if not self._is_user_authorized_for_source(source):
             if source.user_id is None:
@@ -203,10 +223,332 @@ class GatewayInboundMixin:
             ):
                 await self._hm_offer_pairing_code(source)
             return None
+
+        if not _recognized_control:
+            # Behavior-changing gateway hooks run only after the existing
+            # profile/ignored-channel/auth gates. A hook may rewrite text, but
+            # it may not replace or mutate the authenticated route identity.
+            source_identity = tuple(
+                getattr(source, field_name, None)
+                for field_name in (
+                    "platform", "chat_id", "chat_id_alt", "chat_type",
+                    "user_id", "user_id_alt", "thread_id", "parent_chat_id",
+                    "scope_id", "guild_id", "profile", "is_bot",
+                    "role_authorized", "delivered_via_upstream_relay",
+                )
+            )
+            event = self._hm_pre_gateway_dispatch_hook(event, source)
+            if event is None:
+                return None
+            if (
+                getattr(event, "source", None) is not source
+                or tuple(
+                    getattr(source, field_name, None)
+                    for field_name in (
+                        "platform", "chat_id", "chat_id_alt", "chat_type",
+                        "user_id", "user_id_alt", "thread_id", "parent_chat_id",
+                        "scope_id", "guild_id", "profile", "is_bot",
+                        "role_authorized", "delivered_via_upstream_relay",
+                    )
+                ) != source_identity
+            ):
+                logger.warning("Dropping gateway event after plugin route mutation")
+                return None
+            if isinstance(original_control_text, str):
+                # Preserve the literal text for the terminal control seam even
+                # though ordinary messages are the only events reaching here.
+                event._hm_pre_user_message_text = original_control_text
+
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
         return event, source, False
+
+    async def _hm_pre_user_message_control(
+        self, event: "MessageEvent", source: SessionSource, quick_key: str
+    ) -> Optional[str]:
+        """Consume recognized controls after auth and before pending/model dispatch."""
+        if getattr(event, "internal", False):
+            return None
+        control_text = getattr(event, "_hm_pre_user_message_text", None)
+        if not isinstance(control_text, str):
+            control_text = event.text
+        if not isinstance(control_text, str):
+            return None
+        try:
+            from hermes_cli.pre_user_message import (
+                CONTROL_PLANE_UNAVAILABLE_RESPONSE,
+                is_core_stamped_context,
+                is_core_workspace_current,
+                is_project_main_control_message,
+            )
+            _recognized = is_project_main_control_message(control_text)
+        except Exception:
+            logger.debug("pre_user_message classifier unavailable")
+            try:
+                from hermes_cli.project_main_control_fallback import (
+                    CONTROL_PLANE_UNAVAILABLE_RESPONSE,
+                    is_project_main_control_message_fallback,
+                )
+            except Exception:
+                return None
+            if not is_project_main_control_message_fallback(control_text):
+                return None
+            return CONTROL_PLANE_UNAVAILABLE_RESPONSE
+        if not _recognized:
+            return None
+
+        inflight = self.__dict__.setdefault("_pre_user_message_inflight", set())
+        inflight_lock = self.__dict__.setdefault(
+            "_pre_user_message_inflight_lock", threading.Lock()
+        )
+        if not isinstance(quick_key, str) or not quick_key:
+            return CONTROL_PLANE_UNAVAILABLE_RESPONSE
+        lease_registry = getattr(self, "_turn_leases", None)
+        session_store = getattr(self, "session_store", None)
+        # Ordinary turns may create/heal routes.  Control traffic may only follow
+        # an already durable route, including read-only topic recovery.
+        try:
+            resolved = await self._hmwa_resolve_existing_session(event, source)
+        except Exception:
+            logger.debug("pre_user_message existing-route resolution failed", exc_info=True)
+            resolved = None
+        if resolved is None:
+            return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+        source, route_entry, control_key = resolved
+        resolved_session_id = getattr(route_entry, "session_id", None)
+        peek_session_id = getattr(session_store, "peek_session_id", None)
+        # A control is admitted only for an already-resolved gateway route. The
+        # sealed context is not a substitute for the routing index: accepting its
+        # ID here would let a context-only event bind a session without a live
+        # authenticated conversation.
+        if (
+            lease_registry is None
+            or not isinstance(resolved_session_id, str)
+            or not resolved_session_id.strip()
+            or any(ord(char) < 32 for char in resolved_session_id)
+        ):
+            return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+        core_context = self._hm_core_gateway_context(
+            source,
+            quick_key=control_key,
+            session_id=resolved_session_id,
+            route_entry=route_entry,
+        )
+        if not is_core_stamped_context(core_context):
+            return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+        if (
+            core_context.get("surface") != "gateway"
+            or not isinstance(core_context.get("profile_id"), str)
+            or not core_context["profile_id"].strip()
+            or getattr(source, "profile", None)
+            and source.profile != core_context.get("profile_id")
+        ):
+            return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+        context = core_context
+        with inflight_lock:
+            if control_key in inflight:
+                return "PROJECT MAIN CONTROL BLOCKED\nblockers: CURRENT_SESSION_BUSY"
+            inflight.add(control_key)
+        control_lease = None
+        try:
+            try:
+                control_lease = await lease_registry.acquire(
+                    resolved_session_id,
+                    owner_key=control_key,
+                    generation=0,
+                    timeout=DEFAULT_LEASE_WAIT,
+                )
+            except TurnLeaseTimeoutError:
+                return "PROJECT MAIN CONTROL BLOCKED\nblockers: CURRENT_SESSION_BUSY"
+            except Exception:
+                logger.debug("pre_user_message gateway lease acquisition failed")
+                return CONTROL_PLANE_UNAVAILABLE_RESPONSE
+            try:
+                latest_session_id = await asyncio.to_thread(
+                    peek_session_id, control_key
+                ) if callable(peek_session_id) else None
+            except Exception:
+                latest_session_id = None
+            if latest_session_id != resolved_session_id:
+                return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+            if self._is_session_running(quick_key) or self._is_session_running(control_key):
+                return "PROJECT MAIN CONTROL BLOCKED\nblockers: CURRENT_SESSION_BUSY"
+            try:
+                from hermes_cli.lifecycle import (
+                    _CORE_PLUGIN_OWNER_PROJECT_MAIN,
+                    invoke_hook,
+                )
+
+                required = ("session_id", "profile_id", "connection_id", "workspace_root")
+                if any(
+                    not isinstance(context.get(field), str) or not context[field].strip()
+                    for field in required
+                ):
+                    return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+                if not is_core_workspace_current(context["workspace_root"]):
+                    return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+                results = await asyncio.to_thread(
+                    invoke_hook,
+                    "pre_user_message",
+                    _core_plugin_owner=_CORE_PLUGIN_OWNER_PROJECT_MAIN,
+                    message=control_text,
+                    context=context,
+                    surface="gateway",
+                    session_id=resolved_session_id,
+                    session_busy=False,
+                    authorization=None,
+                )
+            except Exception:
+                logger.debug("pre_user_message gateway hook dispatch failed")
+                return CONTROL_PLANE_UNAVAILABLE_RESPONSE
+            if not isinstance(results, (list, tuple)):
+                return CONTROL_PLANE_UNAVAILABLE_RESPONSE
+            for result in results:
+                if (
+                    isinstance(result, dict)
+                    and result.get("action") == "handled"
+                    and result.get("handler") == "project-main-binding"
+                ):
+                    response = result.get("response")
+                    return response if isinstance(response, str) else ""
+            return CONTROL_PLANE_UNAVAILABLE_RESPONSE
+        finally:
+            if control_lease is not None:
+                with suppress(Exception):
+                    lease_registry.release(control_lease)
+            with inflight_lock:
+                inflight.discard(control_key)
+
+    def _hm_core_gateway_context(
+        self,
+        source: SessionSource,
+        *,
+        quick_key: str,
+        session_id: str,
+        route_entry: Any,
+    ) -> Any:
+        """Stamp a gateway context from core-owned route state after authentication.
+
+        The workspace is captured once from explicit host configuration at
+        ``GatewayRunner`` construction.  It is never read from ``source``,
+        ``TERMINAL_CWD``, or the ambient process CWD.  The route entry and its
+        origin prove that this source is the already-persisted conversation.
+        """
+        try:
+            from hermes_cli.pre_user_message import (
+                _CORE_ISSUER,
+                _stamp_core_trusted_context,
+                unwrap_core_workspace,
+            )
+        except Exception:
+            return None
+        if (
+            not isinstance(quick_key, str)
+            or not quick_key
+            or not isinstance(session_id, str)
+            or not session_id.strip()
+            or route_entry is None
+            or getattr(route_entry, "session_key", None) != quick_key
+            or getattr(route_entry, "session_id", None) != session_id
+        ):
+            return None
+        origin = getattr(route_entry, "origin", None)
+        if origin is None:
+            return None
+        # The durable route, not mutable inbound profile/session attributes, is
+        # authoritative for the identity of an existing conversation.
+        for field in ("platform", "chat_id", "chat_type"):
+            if getattr(origin, field, None) != getattr(source, field, None):
+                return None
+        if getattr(origin, "thread_id", None) != getattr(source, "thread_id", None):
+            return None
+        origin_profile = getattr(origin, "profile", None)
+        source_profile = getattr(source, "profile", None)
+        if origin_profile and source_profile and origin_profile != source_profile:
+            return None
+        multiplex = bool(getattr(getattr(self, "config", None), "multiplex_profiles", False))
+        if multiplex and not isinstance(origin_profile, str):
+            return None
+        profile_id = origin_profile or getattr(self, "_primary_profile_name", None)
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            return None
+        if source_profile and source_profile != profile_id:
+            return None
+
+        # ``build_source`` keeps the receiving adapter as a non-serializable
+        # weakref. Require that adapter to still be registered on this runner so
+        # a restored/hand-built source cannot mint a connection identity.
+        adapter_ref = getattr(source, "_transport_adapter_ref", None)
+        adapter = adapter_ref() if callable(adapter_ref) else None
+        if adapter is None:
+            return None
+        registered = any(
+            adapter is candidate
+            for candidate in (getattr(self, "adapters", None) or {}).values()
+        )
+        if not registered:
+            for profile_adapters in (getattr(self, "_profile_adapters", None) or {}).values():
+                if any(adapter is candidate for candidate in (profile_adapters or {}).values()):
+                    registered = True
+                    break
+        if not registered:
+            return None
+
+        workspace_root = unwrap_core_workspace(
+            getattr(self, "_core_gateway_workspace_root", None)
+        )
+        if workspace_root is None:
+            return None
+        platform_name = getattr(getattr(source, "platform", None), "value", source.platform)
+        # Adapter attributes are mutable implementation state, not an authority
+        # boundary.  The durable route's profile is the identity used here.
+        connection_id = f"gateway:{profile_id}:{platform_name}"
+        return _stamp_core_trusted_context({
+            "session_id": session_id,
+            "profile_id": profile_id,
+            "connection_id": connection_id,
+            "workspace_root": workspace_root,
+            "session_title": getattr(route_entry, "display_name", None) or "",
+            "conversation_kind": "gateway_chat",
+            "surface": "gateway",
+            "profile_home": None,
+            "bound_project_id": None,
+        }, issuer=_CORE_ISSUER)
+
+    @staticmethod
+    def _hm_control_workspace_root(source: SessionSource, profile_home) -> Optional[str]:
+        """Return only a workspace from a core-stamped context.
+
+        ``_trusted_workspace_root`` was a legacy dynamic attribute and is not an
+        authority boundary: restored events, plugins, and test/client objects can
+        attach it.  Gateway control code must use the sealed context instead.
+        """
+        try:
+            from hermes_cli.pre_user_message import (
+                is_core_stamped_context,
+                is_core_workspace_current,
+            )
+        except Exception:
+            return None
+        core_context = getattr(source, "_core_trusted_context", None)
+        if not is_core_stamped_context(core_context):
+            return None
+        source_value = core_context.get("workspace_root")
+        if not isinstance(source_value, (str, Path)) or not str(source_value).strip():
+            return None
+        try:
+            return source_value if is_core_workspace_current(source_value) else None
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def _hm_control_is_inflight(self, quick_key: str) -> bool:
+        inflight = self.__dict__.get("_pre_user_message_inflight")
+        lock = self.__dict__.get("_pre_user_message_inflight_lock")
+        if not inflight or lock is None:
+            return False
+        with lock:
+            return quick_key in inflight
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
@@ -1204,11 +1546,17 @@ class GatewayInboundMixin:
         # calls handle_message directly, so a teardown on the relay's inbound
         # handler left those turns muted.
 
+        _quick_key = self._session_key_for_source(source)
+        _control_response = await self._hm_pre_user_message_control(event, source, _quick_key)
+        if _control_response is not None:
+            return _control_response
+        if self._hm_control_is_inflight(_quick_key):
+            return "PROJECT MAIN CONTROL BLOCKED\nblockers: CURRENT_SESSION_BUSY"
+
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
             return _paused_notice
 
-        _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply

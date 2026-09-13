@@ -2527,6 +2527,108 @@ from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
 _PASTE_REF_RE = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
 
 
+def _pre_user_message_control_impl(cli, message: str) -> tuple[bool, str | None]:
+    """Consume a recognized control using only a core-stamped CLI snapshot."""
+    if not isinstance(message, str):
+        return False, None
+    try:
+        from hermes_cli.pre_user_message import (
+            CONTROL_PLANE_UNAVAILABLE_RESPONSE,
+            is_core_stamped_context,
+            is_core_workspace_current,
+            is_project_main_control_message,
+            unwrap_core_trusted_authorization,
+        )
+        _recognized = is_project_main_control_message(message)
+    except Exception:
+        logger.debug("pre_user_message classifier unavailable")
+        try:
+            from hermes_cli.project_main_control_fallback import (
+                is_project_main_control_message_fallback,
+            )
+            fallback_recognized = is_project_main_control_message_fallback(message)
+        except Exception:
+            fallback_recognized = False
+        if not fallback_recognized:
+            return False, None
+        return True, (
+            "PROJECT MAIN CONTROL BLOCKED\n"
+            "blockers: HOST_CONTROL_PLANE_UNAVAILABLE\n"
+            "next_action: verify the Hermes pre_user_message integration and framework_root"
+        )
+    if not _recognized:
+        return False, None
+
+    context_unavailable = (
+        "PROJECT MAIN CONTROL BLOCKED\n"
+        "blockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+    )
+    snapshot = getattr(cli, "_trusted_current_conversation_context", None)
+    if not is_core_stamped_context(snapshot):
+        return True, context_unavailable
+    context = snapshot
+    if context.get("surface") != "cli" or context.get("connection_id") != "cli":
+        return True, context_unavailable
+    required = ("session_id", "profile_id", "connection_id", "workspace_root")
+    if any(
+        not isinstance(context.get(field), str) or not context[field].strip()
+        for field in required
+    ):
+        return True, context_unavailable
+    try:
+        if not is_core_workspace_current(context["workspace_root"]):
+            return True, context_unavailable
+    except (OSError, TypeError, ValueError):
+        return True, context_unavailable
+    try:
+        from hermes_cli.lifecycle import (
+            _CORE_PLUGIN_OWNER_PROJECT_MAIN,
+            invoke_hook,
+        )
+
+        results = invoke_hook(
+            "pre_user_message",
+            _core_plugin_owner=_CORE_PLUGIN_OWNER_PROJECT_MAIN,
+            message=message,
+            context=context,
+            surface="cli",
+            session_id=context["session_id"],
+            session_busy=bool(getattr(cli, "_agent_running", False)),
+            authorization=unwrap_core_trusted_authorization(
+                getattr(cli, "_core_current_chat_main_authorization", None)
+            ),
+        )
+    except Exception:
+        logger.debug("pre_user_message hook dispatch failed")
+        return True, CONTROL_PLANE_UNAVAILABLE_RESPONSE
+    if not isinstance(results, (list, tuple)):
+        return True, CONTROL_PLANE_UNAVAILABLE_RESPONSE
+    for result in results:
+        if (
+            isinstance(result, dict)
+            and result.get("action") == "handled"
+            and result.get("handler") == "project-main-binding"
+        ):
+            response = result.get("response")
+            return True, response if isinstance(response, str) else ""
+    return True, CONTROL_PLANE_UNAVAILABLE_RESPONSE
+
+
+def _pre_user_message_control(cli, message: str) -> tuple[bool, str | None]:
+    """Serialize control dispatch against the CLI's ordinary turn claim."""
+    lock = getattr(cli, "_pre_user_message_control_lock", None)
+    if lock is None:
+        # Bare test doubles and recovery objects may bypass ``__init__``. Keep
+        # the fail-closed behavior without making those adapters authoritative.
+        lock = threading.RLock()
+        try:
+            setattr(cli, "_pre_user_message_control_lock", lock)
+        except Exception:
+            pass
+    with lock:
+        return _pre_user_message_control_impl(cli, message)
+
+
 class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMixin, CLIStatusBarMixin, CLIVoiceMixin, CLIModelSwitchMixin, CLISessionMixin, CLIStreamMixin, CLIModalMixin, CLITerminalMixin, CLIInfoMixin, CLILoopsMixin, CLIChatTurnMixin):
     """Interactive REPL for the Hermes Agent."""
 
@@ -2824,6 +2926,57 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._pending_title: Optional[str] = None
         self._resumed = bool(resume)
         self.session_id = resume or f"{self.session_start.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        try:
+            from hermes_constants import profile_name_for_home
+            trusted_profile_id = profile_name_for_home(_hermes_home) or "default"
+        except Exception:
+            trusted_profile_id = "default"
+
+        # A new CLI session is anchored to the host-selected launch directory. A
+        # resumed session is different: its binding authority must come from the
+        # durable row, so a process started in another checkout cannot retarget
+        # the control by changing CWD or terminal config.
+        trusted_context = None
+        if self._resumed:
+            try:
+                from hermes_cli.pre_user_message import core_context_from_cli_session
+                session_meta = (
+                    self._session_db.get_session(self.session_id)
+                    if self._session_db is not None else None
+                )
+                if session_meta:
+                    trusted_context = core_context_from_cli_session(
+                        session_meta=session_meta,
+                        session_id=str(self.session_id),
+                        profile_id=str(trusted_profile_id),
+                        profile_home=_hermes_home,
+                        connection_id="cli",
+                    )
+            except Exception:
+                # Ordinary resume remains available; only the governed control
+                # is disabled when its immutable identity snapshot cannot be
+                # authenticated.
+                trusted_context = None
+        else:
+            try:
+                trusted_workspace = str(Path.cwd().resolve(strict=False))
+            except (OSError, RuntimeError):
+                trusted_workspace = None
+            from hermes_cli.pre_user_message import _CORE_ISSUER, _stamp_core_trusted_context
+            trusted_context = _stamp_core_trusted_context({
+                "session_id": str(self.session_id),
+                "profile_id": str(trusted_profile_id),
+                "connection_id": "cli",
+                "workspace_root": trusted_workspace,
+                "session_title": "",
+                "conversation_kind": "cli_chat",
+                "surface": "cli",
+                "profile_home": str(_hermes_home),
+                "bound_project_id": None,
+            }, issuer=_CORE_ISSUER)
+        self._trusted_current_conversation_context = trusted_context
+        self._core_current_chat_main_authorization = None
+        self._trusted_current_chat_main_authorization = None
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
 
         self._history_file = _hermes_home / ".hermes_history"
@@ -2888,6 +3041,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._slash_confirm_state = self._model_picker_state = None
         self._clarify_deadline = self._sudo_deadline = self._approval_deadline = self._slash_confirm_deadline = 0
         self._approval_lock = threading.Lock()
+        self._pre_user_message_control_lock = threading.RLock()
         try:  # composer placeholder chosen once so it stays stable on screen
             from hermes_cli.tips import get_random_composer_placeholder
             self._composer_placeholder = get_random_composer_placeholder()
@@ -3469,6 +3623,11 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
             if _had_mouse_reports:
                 self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
+            handled, response = _pre_user_message_control(self, user_input)
+            if handled:
+                if response:
+                    self._console_print(response)
+                return
 
         # A typed bare stop phrase ends an active voice chat (transcripts are checked earlier).
         if not is_voice_input and self._typed_voice_stop(user_input):
@@ -3507,7 +3666,14 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             n = len(submit_images)
             _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
 
-        self._agent_running = self._interactive_turn = True
+        with self._pre_user_message_control_lock:
+            if self._agent_running:
+                # A direct caller raced the serialized input worker; preserve
+                # the message for the normal post-turn drain instead of starting
+                # a second model turn.
+                self._interrupt_queue.put(user_input)
+                return
+            self._agent_running = self._interactive_turn = True
         self._pet_turn_error = self._pet_reasoning = False
         self._turn_summary_begin()
         self._app.invalidate()
@@ -3533,7 +3699,8 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
 
     def _tui_after_turn(self):
         """Post-turn bookkeeping after chat() returns (normal, error, or interrupt)."""
-        self._agent_running = self._pet_reasoning = False
+        with self._pre_user_message_control_lock:
+            self._agent_running = self._pet_reasoning = False
         self._spinner_text = self._last_scrollback_tool = ""
         self._tool_start_time = 0.0
         self._pending_tool_info.clear()
@@ -4404,6 +4571,11 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
     # gateway.session_context.get_session_env, which falls back to os.environ when the session-context layer
     # isn't engaged) and takes the deterministic approvals.single_query_mode path instead of waiting the
     # full timeout. See #86878.
+    control_handled, control_response = _pre_user_message_control(cli, query)
+    if control_handled:
+        if control_response:
+            print(control_response)
+        return
     os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
     if not cli._claim_active_session("cli", stderr=bool(quiet)):
         sys.exit(1)
@@ -4534,6 +4706,22 @@ def main(
 
     # Inject worktree context into agent's system prompt
     if wt_info:
+        if not getattr(cli, "_resumed", False):
+            trusted_context = getattr(cli, "_trusted_current_conversation_context", None)
+            try:
+                from hermes_cli.pre_user_message import (
+                    _CORE_ISSUER,
+                    _replace_core_trusted_context,
+                    is_core_stamped_context,
+                )
+                if is_core_stamped_context(trusted_context):
+                    cli._trusted_current_conversation_context = _replace_core_trusted_context(
+                        trusted_context, issuer=_CORE_ISSUER, workspace_root=str(wt_info["path"])
+                    )
+            except Exception:
+                # Worktree setup must never make the ordinary CLI unusable; an
+                # unavailable control snapshot simply fails closed at its seam.
+                pass
         wt_note = (
             f"\n\n[System note: You are working in an isolated git worktree at "
             f"{wt_info['path']}. Your branch is `{wt_info['branch']}`. "

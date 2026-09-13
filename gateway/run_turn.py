@@ -284,8 +284,11 @@ class GatewayTurnMixin:
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
-        recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
-                     if not expected_session_key else None)
+        recovered = (
+            await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
+            if not expected_session_key and self._is_telegram_dm(source)
+            else None
+        )
         if recovered is not None:
             logger.info(
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
@@ -333,6 +336,57 @@ class GatewayTurnMixin:
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
         return source, session_entry, session_key
+
+    async def _hmwa_resolve_existing_session(self, event, source):
+        """Resolve a control message to an existing route without creating or healing state.
+
+        Ordinary turns use ``_hmwa_resolve_session`` because they may create, reset,
+        or heal a route.  A control-plane binding must not do any of those things;
+        it only follows read-only topic recovery and the durable routing index.
+        """
+        metadata = getattr(event, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        expected_key = str(metadata.get("gateway_session_key") or "").strip()
+        resolved_source = source
+        if not expected_key:
+            try:
+                if self._is_telegram_dm(source):
+                    recovered = await asyncio.to_thread(
+                        self._recover_telegram_topic_thread_id, source
+                    )
+                    if recovered is not None:
+                        adapter_ref = getattr(source, "_transport_adapter_ref", None)
+                        resolved_source = dataclasses.replace(source, thread_id=recovered)
+                        if callable(adapter_ref):
+                            with suppress(Exception):
+                                resolved_source._transport_adapter_ref = adapter_ref
+                        with suppress(Exception):
+                            event.source = resolved_source
+            except Exception:
+                logger.debug("control route recovery failed", exc_info=True)
+                return None
+        try:
+            route_key = expected_key or self._session_key_for_source(resolved_source)
+            if not route_key:
+                return None
+            if expected_key and self._session_key_for_source(resolved_source) != expected_key:
+                return None
+            session_entry = await self.async_session_store.lookup_by_session_key(route_key)
+        except Exception:
+            logger.debug("control existing-route lookup failed", exc_info=True)
+            return None
+        if (
+            session_entry is None
+            or getattr(session_entry, "session_key", None) != route_key
+            or not isinstance(getattr(session_entry, "session_id", None), str)
+            or not session_entry.session_id.strip()
+        ):
+            return None
+        pinned_session_id = str(metadata.get("gateway_session_id") or "").strip()
+        if pinned_session_id and pinned_session_id != session_entry.session_id:
+            return None
+        self._cache_session_source(route_key, resolved_source)
+        return resolved_source, session_entry, route_key
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
         """Follow the (chat_id, thread_id) topic binding — healed to its compression tip — or record

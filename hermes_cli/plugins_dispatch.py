@@ -45,7 +45,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call", "pre_user_message"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
@@ -148,6 +148,22 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
 
 
 class PluginDispatchMixin:
+    def _remove_hook_callback(self, key: str, callback: Callable, owner: Any) -> None:
+        """Remove one hook callback and its parallel owner entry by identity."""
+        callbacks = self._hooks.get(key)
+        if callbacks is None:
+            return
+        owners = getattr(self, "_hook_owners", {}).get(key, [])
+        for index in range(len(callbacks) - 1, -1, -1):
+            if callbacks[index] is callback and index < len(owners) and owners[index] == owner:
+                del callbacks[index]
+                del owners[index]
+                break
+        if not callbacks:
+            self._hooks.pop(key, None)
+        if not owners:
+            getattr(self, "_hook_owners", {}).pop(key, None)
+
     @staticmethod
     def _invoke_hook_callback(callback: Callable, payload: Dict[str, Any]) -> Any:
         """Invoke a hook while withholding additive fields from narrow legacy callbacks.
@@ -169,6 +185,46 @@ class PluginDispatchMixin:
             if name in parameters and parameters[name].kind in keyword_kinds
         }))
 
+    def _invoke_hook_callbacks(
+        self, hook_name: str, kwargs: Dict[str, Any], *,
+        allowed_owner: Any = None,
+    ) -> List[Any]:
+        """Invoke callbacks, optionally restricted to a host-recorded plugin owner."""
+        from hermes_cli.plugins import _resolve_hook_callback_timeout
+        results: List[Any] = []
+        timeout = _resolve_hook_callback_timeout()
+        use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
+        fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
+        callbacks = self._hooks.get(hook_name, [])
+        owners = getattr(self, "_hook_owners", {}).get(hook_name, [])
+        for index, cb in enumerate(callbacks):
+            callback_owner = owners[index] if index < len(owners) else None
+            if allowed_owner is not None:
+                owner_matches = (
+                    callback_owner is allowed_owner
+                    if not isinstance(allowed_owner, str)
+                    else callback_owner == allowed_owner
+                )
+                if not owner_matches:
+                    continue
+            try:
+                if use_timeout:
+                    ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
+                    if ret is _HOOK_SKIPPED:
+                        if fail_closed:
+                            ret = {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}
+                        else:
+                            continue
+                else:
+                    ret = self._invoke_hook_callback(cb, kwargs)
+                if ret is not None:
+                    results.append(ret)
+            except Exception as exc:
+                logger.warning(
+                    "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc
+                )
+        return results
+
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all callbacks for *hook_name*; return their non-``None`` results.
 
@@ -178,31 +234,34 @@ class PluginDispatchMixin:
         closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
         caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
         """
-        from hermes_cli.plugins import _resolve_hook_callback_timeout
-        # Gateway platform events define event-local envelopes; a bus-wide version here would turn
-        # unrelated adapter payloads into one monolithic compatibility contract.
         if hook_name != "gateway_platform_event":
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
-        results: List[Any] = []
-        timeout = _resolve_hook_callback_timeout()
-        use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
-        fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
-            try:
-                if use_timeout:
-                    ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
-                    if ret is _HOOK_SKIPPED:
-                        if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
-                        continue
-                else:
-                    ret = self._invoke_hook_callback(cb, kwargs)
-                if ret is not None:
-                    results.append(ret)
-            except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
-        return results
+        return self._invoke_hook_callbacks(hook_name, kwargs)
+
+    def invoke_hook_for_plugin(self, plugin_id: str, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke only callbacks registered by the exact host-recorded plugin id."""
+        if not isinstance(plugin_id, str) or not plugin_id.strip():
+            return []
+        plugin_id = plugin_id.strip()
+        if plugin_id == "project-main-binding":
+            # The governed callback is registered under an opaque core token;
+            # the public string namespace can never select it.
+            return []
+        if hook_name != "gateway_platform_event":
+            kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        return self._invoke_hook_callbacks(
+            hook_name, kwargs, allowed_owner=plugin_id
+        )
+
+    def invoke_hook_for_capability(self, owner: object, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke callbacks owned by one opaque core-issued capability."""
+        if owner is None:
+            return []
+        if hook_name != "gateway_platform_event":
+            kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        return self._invoke_hook_callbacks(
+            hook_name, kwargs, allowed_owner=owner
+        )
 
     def _run_hook_callback_bounded(
         self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float

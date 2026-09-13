@@ -269,8 +269,13 @@ class PluginLoaderMixin:
     def _load_plugin_scoped(self, manifest: PluginManifest) -> None:
         """Load one plugin with the manager's home bound as current."""
         from hermes_cli.plugins import LoadedPlugin, PluginContext, _PLUGINS_DEBUG
+        from hermes_cli.plugins import _is_trusted_project_main_manifest
         loaded = LoadedPlugin(manifest=manifest)
         plugin_key = manifest_key(manifest)
+        owner_capability = None
+        if _is_trusted_project_main_manifest(manifest, self.home_path):
+            from hermes_cli.lifecycle import _CORE_PLUGIN_OWNER_PROJECT_MAIN
+            owner_capability = _CORE_PLUGIN_OWNER_PROJECT_MAIN
         logger.debug(
             "Loading plugin '%s' (source=%s, kind=%s, path=%s)",
             plugin_key, manifest.source, manifest.kind, manifest.path,
@@ -312,7 +317,9 @@ class PluginLoaderMixin:
                 loaded.error = "no register() function"
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
-                register_fn(PluginContext(manifest, self))
+                register_fn(PluginContext(
+                    manifest, self, owner_capability=owner_capability
+                ))
                 self._attribute_registrations(loaded, plugin_key, registration_start)
                 loaded.enabled = True
                 from hermes_cli.plugins_ledger import _hook_source_of

@@ -20,6 +20,7 @@ Covers:
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -196,6 +197,13 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
 
     runner = _bootstrap(monkeypatch, tmp_path)
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=runner.session_store.get_or_create_session.return_value
+        ),
+        load_transcript=AsyncMock(),
+    )
     runner._turn_leases = SessionTurnLeaseRegistry()
     holder = await runner._turn_leases.acquire(
         "sess-dedup", owner_key="holder-key", generation=1, timeout=1
@@ -203,6 +211,17 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     assert holder is not None
     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
     monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
+
+    class ReadyPluginManager:
+        _discovered = True
+
+        def invoke_hook(self, hook_name, **_kwargs):
+            assert hook_name == "pre_gateway_dispatch"
+            return []
+
+    from hermes_cli import plugins
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: ReadyPluginManager())
+    monkeypatch.setattr(plugins, "_background_discovery_thread", None)
 
     runner.session_store.load_transcript.side_effect = AssertionError(
         "transcript must not load after a turn-lease timeout"

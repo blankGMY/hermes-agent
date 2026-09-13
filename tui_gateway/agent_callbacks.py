@@ -139,10 +139,31 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
              if c.get("session_key") == key or getattr(c.get("agent"), "session_id", None) == key),
             ("", None))
     resolved = os.path.abspath(os.path.expanduser(str(path)))
-    if session is None or not os.path.isdir(resolved):
+    try:
+        from hermes_cli.pre_user_message import snapshot_core_workspace
+        safe_workspace = snapshot_core_workspace(resolved)
+    except Exception:
+        safe_workspace = None
+    if session is None or safe_workspace is None:
         return
+    resolved = safe_workspace
     # explicit switch supersedes a settle-adopted cwd
     session.update(cwd=resolved, explicit_cwd=True, cwd_from_settle=False)
+    try:
+        from hermes_cli.pre_user_message import (
+            _CORE_ISSUER,
+            _replace_core_trusted_context,
+            is_core_stamped_context,
+        )
+        core_context = session.get("_core_trusted_context")
+        if is_core_stamped_context(core_context):
+            session["_core_trusted_context"] = _replace_core_trusted_context(
+                core_context, issuer=_CORE_ISSUER, workspace_root=resolved
+            )
+    except Exception:
+        # The explicit workspace move remains useful to ordinary turns; a
+        # failed control snapshot causes only the governed action to fail closed.
+        session["_core_trusted_context"] = None
     _register_session_cwd(session)
     _persist_session_cwd_and_schedule_git_meta(session, resolved)
     try:

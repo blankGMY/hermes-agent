@@ -19,6 +19,7 @@ import logging
 import os
 import queue
 import re
+import stat
 import sys
 import threading
 import types
@@ -80,6 +81,54 @@ class PluginToolOverrideError(PermissionError):
 
 logger = logging.getLogger(__name__)
 
+_PROJECT_MAIN_PLUGIN_ID = "project-main-binding"
+
+
+def _is_trusted_project_main_manifest(manifest: PluginManifest, home_path: Path) -> bool:
+    """Recognize only the consented profile-local Project MAIN plugin.
+
+    The owner string used by the lifecycle capability is not a registration
+    authority.  A same-named project plugin or entry point must not receive the
+    behavior-changing hook merely by choosing the reserved identifier.
+    """
+    if (
+        manifest_key(manifest) != _PROJECT_MAIN_PLUGIN_ID
+        or manifest.name != _PROJECT_MAIN_PLUGIN_ID
+        or manifest.source != "user"
+        or manifest.portable
+        or not manifest.path
+    ):
+        return False
+    try:
+        expected = home_path / "plugins" / _PROJECT_MAIN_PLUGIN_ID
+        actual = Path(manifest.path)
+        if not actual.is_absolute():
+            return False
+        # Compare both the lexical path and its resolved target.  A same-named
+        # plugin is trusted only when its path is exactly the profile-local
+        # location, not merely an alias that resolves there.
+        if (
+            os.path.normcase(os.path.abspath(str(actual)))
+            != os.path.normcase(os.path.abspath(str(expected)))
+        ):
+            return False
+
+        # ``Path.resolve()`` alone follows junctions/symlinks.  Inspect every
+        # ancestor first so ``home/plugins`` cannot redirect the privileged
+        # location outside the profile while preserving the same lexical path.
+        for candidate in (actual, expected):
+            absolute = Path(os.path.abspath(str(candidate)))
+            for component in reversed((absolute, *absolute.parents)):
+                try:
+                    info = os.lstat(component)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode) or int(getattr(info, "st_file_attributes", 0)) & 0x0400:
+                    return False
+        return actual.resolve(strict=False) == expected.resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
 # ``HERMES_PLUGINS_DEBUG=1`` tees verbose discovery logs to stderr in addition to agent.log. Read
 # once at import; tests flip it mid-process via ``_install_plugin_debug_handler(force=True)``.
 _PLUGINS_DEBUG = env_var_enabled("HERMES_PLUGINS_DEBUG")
@@ -127,10 +176,14 @@ VALID_HOOKS: Set[str] = {
     "on_session_finalize", "on_session_reset",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
-    # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
-    # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
+    # pre_gateway_dispatch: once per incoming MessageEvent, after route and auth/pairing gates and
+    # before ordinary dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.
     "pre_gateway_dispatch",
+    # pre_user_message: behavior-changing control-plane seam immediately before a user message is
+    # appended or an agent turn starts. Kwargs: message, context, surface, session_busy, authorization.
+    # Return {"action": "handled", "response": ..., "decision": ...} to stop normal model dispatch.
+    "pre_user_message",
     # Approval observers (tools/approval.py); returns ignored — plugins cannot veto or pre-answer
     # (use pre_tool_call). Kwargs: command, description, pattern_key, pattern_keys, session_key,
     # surface: "cli"|"gateway"|"smart"; post_approval_response adds choice ("once"|"session"|
@@ -221,9 +274,12 @@ class LoadedPlugin:
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
-    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+    def __init__(
+        self, manifest: PluginManifest, manager: "PluginManager", *, owner_capability: object = None
+    ):
         self.manifest = manifest
         self._manager = manager
+        self._owner_capability = owner_capability
         self._llm: Any = None  # lazy; tests preseed it (see ``llm``)
 
     @property
@@ -899,7 +955,10 @@ class PluginContext:
 
     def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
-        return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
+        return self._track_callback(
+            "hook", hook_name, callback, self._manager._hooks, VALID_HOOKS,
+            owner=(self._owner_capability if self._owner_capability is not None else self.plugin_id),
+        )
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
         """Register behavior-changing middleware (request kinds rewrite the payload, execution kinds
@@ -910,14 +969,22 @@ class PluginContext:
 
     def _track_callback(
         self, kind: str, key: str, callback: Callable, mapping: Dict[str, List[Callable]],
-        valid: Set[str],
+        valid: Set[str], owner: Any = None,
     ) -> PluginRegistration:
         """Append ``callback`` under ``key`` (warning on unknown ``key``) and lease its removal."""
         if key not in valid:
             logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                            key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
-        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
+        if kind == "hook":
+            registered_owner = owner if owner is not None else self.plugin_id
+            self._manager._hook_owners.setdefault(key, []).append(registered_owner)
+            release = lambda: self._manager._remove_hook_callback(
+                key, callback, registered_owner
+            )
+        else:
+            release = lambda: self._manager._remove_callback(mapping, key, callback)
+        handle = self._track(kind, key, release)
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
 
@@ -1134,6 +1201,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # (matcher, callback, plugin_name), platform handler factories (lowercase platform -> list).
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._hook_owners: Dict[str, List[Any]] = {}
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: Dict[Tuple[str, str], List[PluginRegistration]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
@@ -1690,7 +1758,44 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire
     callbacks registered by user plugins (tracking #64178).
     """
+    if hook_name == "pre_gateway_dispatch":
+        # This ingress hook runs after auth and must not join a first-use
+        # discovery scan on the gateway event loop.
+        return invoke_hook_nowait(hook_name, **kwargs)
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_hook_nowait(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Dispatch an authenticated gateway policy hook without joining lazy plugin discovery.
+
+    ``pre_gateway_dispatch`` runs after authentication and must not block the
+    gateway event loop on a first-use discovery scan. Until discovery reaches
+    a stable, fully-loaded manager, return a fail-closed skip directive; the
+    next inbound event can run the hook after discovery completes.
+    """
+    manager = get_plugin_manager()
+    discovery_thread = _background_discovery_thread
+    if (
+        not getattr(manager, "_discovered", False)
+        or (
+            discovery_thread is not None
+            and discovery_thread.is_alive()
+            and discovery_thread is not threading.current_thread()
+        )
+    ):
+        start_background_plugin_discovery()
+        return [{"action": "skip", "reason": "plugin_discovery_pending"}]
+    return manager.invoke_hook(hook_name, **kwargs)
+
+
+def invoke_hook_for_plugin(plugin_id: str, hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke one hook only for callbacks owned by *plugin_id*."""
+    return _delivery_manager().invoke_hook_for_plugin(plugin_id, hook_name, **kwargs)
+
+
+def invoke_hook_for_capability(owner: object, hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke one hook only for callbacks carrying the exact core capability."""
+    return _delivery_manager().invoke_hook_for_capability(owner, hook_name, **kwargs)
 
 
 def render_system_prompt_sections(session_info: Mapping[str, Any]) -> List[RenderedPluginSystemPromptSection]:

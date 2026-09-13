@@ -2339,9 +2339,33 @@ def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | Non
         if db is not None:
             row = db.get_session(key) if hasattr(db, "get_session") else None
             if row and row.get("cwd"):
+                try:
+                    from hermes_cli.pre_user_message import snapshot_core_workspace
+                    safe_cwd = snapshot_core_workspace(row["cwd"])
+                except Exception:
+                    safe_cwd = None
                 with _sessions_lock:
                     if sid in _sessions:
-                        _sessions[sid]["cwd"] = row["cwd"]
+                        if safe_cwd is None:
+                            # Do not adopt a mutable/reparse path from the
+                            # durable row into either the live session or its
+                            # trusted control snapshot.
+                            _sessions[sid]["_core_trusted_context"] = None
+                        else:
+                            _sessions[sid]["cwd"] = safe_cwd
+                            try:
+                                from hermes_cli.pre_user_message import (
+                                    _CORE_ISSUER,
+                                    _replace_core_trusted_context,
+                                    is_core_stamped_context,
+                                )
+                                core_context = _sessions[sid].get("_core_trusted_context")
+                                if is_core_stamped_context(core_context):
+                                    _sessions[sid]["_core_trusted_context"] = _replace_core_trusted_context(
+                                        core_context, issuer=_CORE_ISSUER, workspace_root=safe_cwd
+                                    )
+                            except Exception:
+                                _sessions[sid]["_core_trusted_context"] = None
             elif hasattr(db, "update_session_cwd"):
                 try:
                     _persist_session_cwd_and_schedule_git_meta(_sessions[sid], _sessions[sid]["cwd"], db=db)
@@ -2373,6 +2397,7 @@ def _init_session(
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
         }
+        _sessions[sid]["_core_trusted_context"] = _core_tui_context(key, _sessions[sid])
         _session_todo_state(_sessions[sid])
     _hydrate_session_cwd(sid, key, session_db, profile_home)
     _register_session_cwd(_sessions[sid])
@@ -2422,7 +2447,7 @@ def _deferred_session_record(
     explicit_cwd: bool = False) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent."""
     now = time.time()
-    return {
+    record = {
         "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
         "close_on_disconnect": close_on_disconnect, "active_session_lease": lease, "cols": cols,
         "created_at": now, "cwd": cwd, "display_history_prefix": display_history_prefix or [],
@@ -2437,6 +2462,28 @@ def _deferred_session_record(
         "tool_started_at": {}, "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
     }
+    try:
+        from hermes_cli.pre_user_message import _CORE_ISSUER, _stamp_core_trusted_context
+        from hermes_constants import profile_name_for_home
+        profile_id = profile_name_for_home(profile_home) if profile_home else None
+        if not profile_id:
+            profile_id = _current_profile_name()
+        record["_core_trusted_context"] = _stamp_core_trusted_context({
+            "session_id": str(session_key or ""),
+            "profile_id": str(profile_id or ""),
+            "connection_id": "tui-gateway",
+            "workspace_root": str(cwd) if explicit_cwd else None,
+            "session_title": "",
+            "conversation_kind": "tui_chat",
+            "surface": "tui",
+            "profile_home": record["profile_home"],
+            "bound_project_id": None,
+        }, issuer=_CORE_ISSUER)
+    except Exception:
+        # Unsupported/partially initialized adapters fail closed only for the
+        # governed control; ordinary deferred sessions remain usable.
+        record["_core_trusted_context"] = None
+    return record
 
 
 _ANY_PROFILE = object()  # default: match a live session regardless of profile

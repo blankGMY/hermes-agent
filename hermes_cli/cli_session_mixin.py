@@ -144,6 +144,9 @@ class CLISessionMixin:
         terminal backend snapshots cwd on first use, after this). No-op when no cwd was
         recorded, the directory is gone (dim warning, never a crash), or we're already there.
         """
+        refresh_context = getattr(self, "_refresh_trusted_context_from_session", None)
+        if callable(refresh_context):
+            refresh_context(session_meta)
         recorded = (session_meta or {}).get("cwd")
         if not recorded:
             return

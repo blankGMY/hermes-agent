@@ -407,6 +407,31 @@ class CLIAgentSetupMixin:
         route["request_overrides"] = overrides
         return route
 
+    def _refresh_trusted_context_from_session(self, session_meta) -> None:
+        """Replace the CLI control snapshot from the exact resumed SessionDB row."""
+        if not getattr(self, "_resumed", False):
+            return
+        try:
+            from hermes_cli.pre_user_message import (
+                core_context_from_cli_session,
+                is_core_stamped_context,
+            )
+            current = getattr(self, "_trusted_current_conversation_context", None)
+            if not is_core_stamped_context(current):
+                self._trusted_current_conversation_context = None
+                return
+            self._trusted_current_conversation_context = core_context_from_cli_session(
+                session_meta=session_meta,
+                session_id=str(self.session_id),
+                profile_id=str(current["profile_id"]),
+                profile_home=current.get("profile_home"),
+                connection_id=str(current["connection_id"]),
+            )
+        except Exception:
+            # A normal resume can still be useful when its workspace/profile
+            # metadata is incomplete; only the governed control is disabled.
+            self._trusted_current_conversation_context = None
+
     def _follow_compression_chain(self, session_meta, announce):
         """If the resumed id is an empty compression-chain head, announce and switch to
         the descendant holding the messages; returns the (possibly refreshed) meta."""
@@ -415,6 +440,8 @@ class CLIAgentSetupMixin:
             announce(resolved_id)
             self.session_id = resolved_id
             session_meta = self._session_db.get_session(self.session_id) or session_meta
+        if getattr(self, "_resumed", False):
+            self._refresh_trusted_context_from_session(session_meta)
         return session_meta
 
     def _restore_session_state(self, session_meta, *, quiet: bool = False) -> None:

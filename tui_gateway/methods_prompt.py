@@ -5,6 +5,7 @@ method_ctx.bind_module), so they reference server.py globals bare.
 """
 
 import contextlib
+from pathlib import Path
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -508,6 +509,134 @@ _TRUNCATION_PARAMS = (
     "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id")
 
 
+def _pre_user_message_control(rid, sid, session, text, params):
+    """Consume recognized controls before any turn state, history row, or agent build."""
+    if not isinstance(text, str):
+        return None
+
+    def _blocked():
+        response = (
+            "PROJECT MAIN CONTROL BLOCKED\n"
+            "blockers: HOST_CONTROL_PLANE_UNAVAILABLE\n"
+            "next_action: verify the Hermes pre_user_message integration and framework_root"
+        )
+        _emit(
+            "message.complete",
+            sid,
+            {"text": response, "control_plane": True, "decision": None},
+        )
+        return _ok(
+            rid,
+            {
+                "status": "blocked",
+                "control_plane": True,
+                "response": response,
+                "decision": None,
+            },
+        )
+
+    try:
+        from hermes_cli.pre_user_message import (
+            is_core_stamped_context,
+            is_core_workspace_current,
+            is_project_main_control_message,
+            unwrap_core_trusted_authorization,
+        )
+        _recognized = is_project_main_control_message(text)
+    except Exception:
+        logger.debug("pre_user_message classifier unavailable")
+        try:
+            from hermes_cli.project_main_control_fallback import (
+                is_project_main_control_message_fallback,
+            )
+        except Exception:
+            return None
+        if not is_project_main_control_message_fallback(text):
+            return None
+        return _blocked()
+    if not _recognized:
+        return None
+    try:
+        from hermes_cli.lifecycle import (
+            _CORE_PLUGIN_OWNER_PROJECT_MAIN,
+            invoke_hook,
+        )
+
+        core_context = session.get("_core_trusted_context")
+        if not is_core_stamped_context(core_context):
+            return _blocked()
+        binding_session_id = core_context.get("session_id")
+        if (
+            not isinstance(binding_session_id, str)
+            or binding_session_id != str(session.get("session_key") or "")
+            or core_context.get("surface") not in {"tui", "desktop"}
+            or core_context.get("connection_id") != "tui-gateway"
+        ):
+            return _blocked()
+        context = core_context
+        requested_surface = "desktop" if params.get("surface") == "hud" else "tui"
+        if context.get("surface") != requested_surface:
+            from hermes_cli.pre_user_message import (
+                _CORE_ISSUER,
+                _replace_core_trusted_context,
+            )
+            context = _replace_core_trusted_context(
+                context, issuer=_CORE_ISSUER, surface=requested_surface
+            )
+        required = ("session_id", "profile_id", "connection_id", "workspace_root")
+        if any(
+            not isinstance(context.get(field), str) or not context[field].strip()
+            for field in required
+        ):
+            return _blocked()
+        if not is_core_workspace_current(context["workspace_root"]):
+            return _blocked()
+        if session.get("running"):
+            return _blocked()
+        results = invoke_hook(
+            "pre_user_message",
+            _core_plugin_owner=_CORE_PLUGIN_OWNER_PROJECT_MAIN,
+            message=text,
+            context=context,
+            surface=context["surface"],
+            session_id=binding_session_id,
+            session_busy=bool(session.get("running")),
+            authorization=unwrap_core_trusted_authorization(
+                session.get("_core_current_chat_main_authorization")
+            ),
+        )
+    except Exception:
+        logger.debug("pre_user_message hook dispatch failed")
+        return _blocked()
+    if not isinstance(results, (list, tuple)):
+        return _blocked()
+    for result in results:
+        if (
+            not isinstance(result, dict)
+            or result.get("action") != "handled"
+            or result.get("handler") != "project-main-binding"
+        ):
+            continue
+        response = result.get("response")
+        response = response if isinstance(response, str) else ""
+        decision = result.get("decision") if isinstance(result.get("decision"), dict) else None
+        _emit(
+            "message.complete",
+            sid,
+            {"text": response, "control_plane": True, "decision": decision},
+        )
+        return _ok(
+            rid,
+            {
+                "status": "handled",
+                "control_plane": True,
+                "response": response,
+                "decision": decision,
+            },
+        )
+    return _blocked()
+
+
 def _lock_in_submit_turn(
     rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task):
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
@@ -552,13 +681,45 @@ def _(rid, params: dict) -> dict:
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
     if (stopped := _typed_stop_phrase_response(rid, text)) is not None:
         return stopped
-    if params.get("interrupted"):
-        # Client-side barge-in: latch so this turn's model message carries the note.
-        from tools.tts_streaming import mark_speech_interrupted
-        mark_speech_interrupted()
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if isinstance(text, str):
+        try:
+            from hermes_cli.pre_user_message import is_project_main_control_message
+            is_control = is_project_main_control_message(text)
+        except Exception:
+            try:
+                from hermes_cli.project_main_control_fallback import (
+                    is_project_main_control_message_fallback,
+                )
+                is_control = is_project_main_control_message_fallback(text)
+            except Exception:
+                is_control = False
+        if is_control:
+            authority = globals().get("_current_session_steer_authority")
+            if callable(authority):
+                _transport, owner = authority(sid if isinstance(sid, str) else "")
+                if owner is not session:
+                    response = "PROJECT MAIN CONTROL BLOCKED\\nblockers: HOST_CONTEXT_OR_CONTROL_PLANE_UNAVAILABLE"
+                    _emit(
+                        "message.complete", sid,
+                        {"text": response, "control_plane": True, "decision": None},
+                    )
+                    return _ok(rid, {
+                        "status": "blocked", "control_plane": True,
+                        "response": response, "decision": None,
+                    })
+    # Hold the live session lock across the control-plane operation.  This keeps
+    # a concurrent ordinary submit from observing idle state and starting a
+    # model turn while binding authorization/commit is still in progress.
+    with session["history_lock"]:
+        if (control_response := _pre_user_message_control(rid, sid, session, text, params)) is not None:
+            return control_response
+    if params.get("interrupted"):
+        # Client-side barge-in: latch only for an ordinary model turn.
+        from tools.tts_streaming import mark_speech_interrupted
+        mark_speech_interrupted()
     from tools.bot_relay import DeliveryAuthor
 
     # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
