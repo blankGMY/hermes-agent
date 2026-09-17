@@ -168,7 +168,7 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 
 # ~/.hermes/.env first, project .env as dev fallback; user env files override stale shell exports.
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, profile_name_for_home
 from hermes_state_ids import new_session_id
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import base_url_host_matches, base_url_hostname, fast_safe_load, is_truthy_value
@@ -2827,7 +2827,12 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self.session_id = resume or new_session_id(self.session_start)
         self._project_main_host_context = {
             "session_id": str(self.session_id),
-            "profile_id": str(getattr(self, "profile_id", None) or "default"),
+            "profile_id": str(
+                getattr(self, "profile_id", None)
+                or profile_name_for_home(get_hermes_home())
+                or "default"
+            ),
+            "profile_home": str(get_hermes_home()),
             "connection_id": f"cli:{self.session_id}",
             "workspace_root": getattr(self, "_project_main_session_workspace", None),
             "surface": "cli",

@@ -94,7 +94,9 @@ def dispatch_pre_user_message(
     if context is None or not is_core_stamped_context(context):
         return (True, CONTROL_PLANE_UNAVAILABLE_RESPONSE) if recognized else (False, None)
     try:
+        from hermes_cli.plugins import discover_plugins
         from hermes_cli.lifecycle import invoke_hook
+        discover_plugins()
         results = invoke_hook(
             "pre_user_message",
             message=message,

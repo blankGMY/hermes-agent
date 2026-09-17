@@ -50,7 +50,7 @@ class CLIChatTurnMixin:
             )
             _control_handled, _control_response = dispatch_pre_user_message(
                 message if isinstance(message, str) else str(message),
-                context=None,
+                context=core_context_from_cli_session(self),
                 surface="cli",
                 parent_agent=None,
                 session_busy=bool(getattr(self, "_agent_running", False)),
