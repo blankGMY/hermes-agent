@@ -1805,6 +1805,10 @@ def cmd_chat(args):
         "compact": getattr(args, "compact", False),
         **{k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH},
     }
+    # A CLI Project MAIN binding is host-issued only for an explicit --in
+    # workspace. Bare process cwd remains ordinary runtime state, not authority.
+    if getattr(args, "in_dir", None):
+        kwargs["workspace_root"] = os.getcwd()
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     try:

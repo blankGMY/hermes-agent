@@ -2551,8 +2551,10 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        workspace_root: str = None,
     ):
         """CLI args win over config; ``reasoning`` is per-run only; ``resume`` restores history from SQLite."""
+        self._project_main_session_workspace = workspace_root
         self._init_display_options(verbose, compact)
         self._init_model_routing(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
                                  checkpoints, pass_session_id, ignore_rules)
@@ -4373,7 +4375,7 @@ def _install_single_query_signal_handlers(cli):
                 _signal.signal(getattr(_signal, _name), _signal_handler_q)
 
 
-def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills, workspace_root=None):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
     if isinstance(toolsets, str) and toolsets:
@@ -4412,6 +4414,7 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
             checkpoints=checkpoints,
             pass_session_id=pass_session_id,
             ignore_rules=ignore_rules,
+            workspace_root=workspace_root,
         )
     except ImportError as e:
         # Direct `python cli.py` bypasses cmd_chat's partial-update ImportError handler.
@@ -4628,6 +4631,7 @@ def main(
     output_format: str = "text",
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    workspace_root: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -4690,7 +4694,8 @@ def main(
             raise ValueError("--format stream-json requires -q/--query")
         quiet = True
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
+                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills,
+                               workspace_root)
 
     # Join the background worktree creation before anything consumes TERMINAL_CWD.
     # A requested worktree whose setup failed aborts: never silently run without isolation.
