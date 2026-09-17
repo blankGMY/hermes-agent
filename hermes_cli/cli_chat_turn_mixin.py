@@ -43,6 +43,35 @@ class CLIChatTurnMixin:
         from tools.process_registry_notifications import TimelineNotification
         # Single-query and direct chat callers do not go through run().
         set_secret_capture_callback(self._secret_capture_callback)
+        try:
+            from hermes_cli.pre_user_message import (
+                core_context_from_cli_session,
+                dispatch_pre_user_message,
+            )
+            _control_handled, _control_response = dispatch_pre_user_message(
+                message if isinstance(message, str) else str(message),
+                context=None,
+                surface="cli",
+                parent_agent=None,
+                session_busy=bool(getattr(self, "_agent_running", False)),
+            )
+            if _control_handled:
+                if _control_response:
+                    _cprint(_control_response)
+                return _control_response
+        except Exception:
+            logging.debug("pre_user_message control seam failed", exc_info=True)
+            _control_text = message if isinstance(message, str) else str(message)
+            _control_lower = _control_text.casefold()
+            if (
+                _control_lower.startswith("@memory set_current_chat_as_main")
+                or ("当前" in _control_text and "main" in _control_lower
+                    and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+                or ("当前" in _control_text and "主会话" in _control_text
+                    and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+            ):
+                _cprint("PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTROL_PLANE_UNAVAILABLE")
+                return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTROL_PLANE_UNAVAILABLE"
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
         self._last_turn_interrupted = False
 
@@ -60,6 +89,35 @@ class CLIChatTurnMixin:
         agent = self.agent
         if agent is None:
             return None
+        try:
+            from hermes_cli.pre_user_message import (
+                core_context_from_cli_session,
+                dispatch_pre_user_message,
+            )
+            _control_handled, _control_response = dispatch_pre_user_message(
+                message if isinstance(message, str) else str(message),
+                context=core_context_from_cli_session(self),
+                surface="cli",
+                parent_agent=agent,
+                session_busy=False,
+            )
+            if _control_handled:
+                if _control_response:
+                    _cprint(_control_response)
+                return _control_response
+        except Exception:
+            logging.debug("pre_user_message control seam failed after agent init", exc_info=True)
+            _control_text = message if isinstance(message, str) else str(message)
+            _control_lower = _control_text.casefold()
+            if (
+                _control_lower.startswith("@memory set_current_chat_as_main")
+                or ("当前" in _control_text and "main" in _control_lower
+                    and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+                or ("当前" in _control_text and "主会话" in _control_text
+                    and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+            ):
+                _cprint("PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTROL_PLANE_UNAVAILABLE")
+                return "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTROL_PLANE_UNAVAILABLE"
         message = self._chat_route_images(message, images)
 
         if isinstance(message, str) and not isinstance(message, TimelineNotification):

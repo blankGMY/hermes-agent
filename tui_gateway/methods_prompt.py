@@ -575,6 +575,37 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    try:
+        from hermes_cli.pre_user_message import (
+            core_context_from_tui_session,
+            dispatch_pre_user_message,
+        )
+        from hermes_cli.project_main_provenance import trusted_live_parent
+        _control_handled, _control_response = dispatch_pre_user_message(
+            text if isinstance(text, str) else str(text),
+            context=core_context_from_tui_session(session, session_id=str(sid)),
+            surface="tui",
+            parent_agent=trusted_live_parent(session.get("agent")),
+            session_busy=bool(session.get("running")),
+        )
+        if _control_handled:
+            return _ok(rid, {"status": "handled", "response": _control_response or "", "control_plane": True})
+    except Exception:
+        logger.debug("pre_user_message TUI seam failed", exc_info=True)
+        _control_text = text if isinstance(text, str) else str(text)
+        _control_lower = _control_text.casefold()
+        if (
+            _control_lower.startswith("@memory set_current_chat_as_main")
+            or ("当前" in _control_text and "main" in _control_lower
+                and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+            or ("当前" in _control_text and "主会话" in _control_text
+                and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+        ):
+            return _ok(rid, {
+                "status": "handled",
+                "response": "PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTROL_PLANE_UNAVAILABLE",
+                "control_plane": True,
+            })
     from tools.bot_relay import DeliveryAuthor
 
     # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.

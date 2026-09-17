@@ -2066,6 +2066,55 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        _control_handled = False
+        _control_response = None
+        try:
+            from hermes_cli.pre_user_message import (
+                core_context_from_gateway,
+                dispatch_pre_user_message,
+            )
+            from hermes_cli.project_main_provenance import trusted_live_parent
+            _core_context = core_context_from_gateway(session_entry=session_entry, source=source)
+            _parent_agent = None
+            try:
+                _parent_agent = trusted_live_parent(self._session_state(session_key).turn.agent)
+            except Exception:
+                pass
+            _control_handled, _control_response = dispatch_pre_user_message(
+                str(getattr(event, "text", "") or ""),
+                context=_core_context,
+                surface="gateway",
+                parent_agent=_parent_agent,
+                session_busy=False,
+            )
+        except Exception:
+            logger.debug("pre_user_message gateway seam failed", exc_info=True)
+            _control_text = str(getattr(event, "text", "") or "")
+            _control_lower = _control_text.casefold()
+            if (
+                _control_lower.startswith("@memory set_current_chat_as_main")
+                or ("当前" in _control_text and "main" in _control_lower
+                    and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+                or ("当前" in _control_text and "主会话" in _control_text
+                    and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+            ):
+                _control_handled = True
+                _control_response = (
+                    "PROJECT MAIN CONTROL BLOCKED\n"
+                    "blockers: HOST_CONTROL_PLANE_UNAVAILABLE"
+                )
+        if _control_handled:
+            try:
+                _control_adapter = self._adapter_for_source(source)
+                if _control_adapter is not None and _control_response:
+                    await _control_adapter.send(
+                        source.chat_id,
+                        _control_response,
+                        metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                    )
+            except Exception:
+                logger.debug("pre_user_message gateway response delivery failed", exc_info=True)
+            return {"handled": True, "already_sent": True, "control_plane": True}
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )

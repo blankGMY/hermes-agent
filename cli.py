@@ -2823,6 +2823,14 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._pending_title: Optional[str] = None
         self._resumed = bool(resume)
         self.session_id = resume or new_session_id(self.session_start)
+        self._project_main_host_context = {
+            "session_id": str(self.session_id),
+            "profile_id": str(getattr(self, "profile_id", None) or "default"),
+            "connection_id": f"cli:{self.session_id}",
+            "workspace_root": getattr(self, "_project_main_session_workspace", None),
+            "surface": "cli",
+            "conversation_kind": "cli_chat",
+        }
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
 
         self._history_file = _hermes_home / ".hermes_history"
@@ -4135,6 +4143,39 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     )
 
     author = take_turn_author_from_env()
+    try:
+        from hermes_cli.pre_user_message import (
+            core_context_from_cli_session,
+            dispatch_pre_user_message,
+        )
+        _control_handled, _control_response = dispatch_pre_user_message(
+            str(effective_query),
+            context=core_context_from_cli_session(cli),
+            surface="cli-quiet",
+            parent_agent=cli.agent,
+            session_busy=False,
+        )
+        if _control_handled:
+            if _control_response:
+                print(_control_response)
+            print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        logger.debug("pre_user_message quiet seam failed", exc_info=True)
+        _control_text = str(effective_query)
+        _control_lower = _control_text.casefold()
+        if (
+            _control_lower.startswith("@memory set_current_chat_as_main")
+            or ("当前" in _control_text and "main" in _control_lower
+                and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+            or ("当前" in _control_text and "主会话" in _control_text
+                and any(token in _control_text for token in ("设为", "设置为", "绑定为")))
+        ):
+            print("PROJECT MAIN CONTROL BLOCKED\nblockers: HOST_CONTROL_PLANE_UNAVAILABLE")
+            print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+            sys.exit(0)
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}

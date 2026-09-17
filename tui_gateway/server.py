@@ -2380,12 +2380,16 @@ def _init_session(
             "tool_progress_mode": _load_tool_progress_mode(), "edit_snapshots": {}, "tool_started_at": {},
             # Profile-scoped HERMES_HOME (None = launch); SessionBranch copies the parent's (same state.db).
             "profile_home": profile_home,
+            "_hermes_profile_id": Path(profile_home).name if profile_home else "default",
+            "_hermes_connection_id": f"tui:{key}",
             # In-session /model switch, honored on rebuild (/new, resume) — never leaks to siblings via env vars.
             "model_override": None,
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
             "auth_user_id": _transport_auth_user_id(current_transport()),
         }
+        from hermes_cli.project_main_provenance import stamp_tui_session_record
+        stamp_tui_session_record(_sessions[sid])
         _session_todo_state(_sessions[sid])
     _hydrate_session_cwd(sid, key, session_db, profile_home)
     _register_session_cwd(_sessions[sid])
@@ -2435,7 +2439,7 @@ def _deferred_session_record(
     explicit_cwd: bool = False) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent."""
     now = time.time()
-    return {
+    record = {
         "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
         "close_on_disconnect": close_on_disconnect, "active_session_lease": lease, "cols": cols,
         "created_at": now, "cwd": cwd, "display_history_prefix": display_history_prefix or [],
@@ -2444,6 +2448,8 @@ def _deferred_session_record(
         "inflight_turn": None, "last_active": now, "lazy": lazy, "model_override": model_override,
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
+        "_hermes_profile_id": Path(profile_home).name if profile_home else "default",
+        "_hermes_connection_id": f"tui:{session_key}",
         "resume_runtime_overrides": resume_runtime_overrides, "resume_session_id": session_key,
         "running": False, "session_key": session_key, "show_reasoning": _load_show_reasoning(),
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
@@ -2451,6 +2457,8 @@ def _deferred_session_record(
         "transport": current_transport() or _stdio_transport,
         "auth_user_id": _transport_auth_user_id(current_transport()),
     }
+    from hermes_cli.project_main_provenance import stamp_tui_session_record
+    return stamp_tui_session_record(record)
 
 
 _ANY_PROFILE = object()  # default: match a live session regardless of profile
@@ -2480,6 +2488,8 @@ def _claim_or_reuse_live(sid: str, session_key: str, record: dict, lease) -> tup
             return live
         with _sessions_lock:
             _sessions[sid] = record
+            from hermes_cli.project_main_provenance import stamp_tui_session_record
+            stamp_tui_session_record(_sessions[sid])
             _register_session_cwd(_sessions[sid])
         # A PRIOR runtime for this stored id may still be sentinel-parked with a reap Timer armed; cancel +
         # finalize it quietly so the reap doesn't broadcast session.reclaimed (storm).
